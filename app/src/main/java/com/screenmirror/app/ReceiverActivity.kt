@@ -1,37 +1,45 @@
 package com.screenmirror.app
 
-import android.content.Context
+import android.Manifest
+import android.app.AlertDialog
+import android.content.pm.PackageManager
 import android.media.MediaCodec
 import android.media.MediaFormat
-import android.net.nsd.NsdManager
-import android.net.nsd.NsdServiceInfo
-import android.net.wifi.WifiManager
+import android.net.wifi.p2p.WifiP2pDevice
+import android.net.wifi.p2p.WifiP2pInfo
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
-import android.widget.TextView
-import androidx.appcompat.app.AppCompatActivity
 import android.view.SurfaceView
+import android.widget.TextView
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import java.io.DataInputStream
 import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
 
-/**
- * Discovers a SenderService instance on the local WiFi network via NSD,
- * connects to it over TCP, and decodes the incoming H.264 stream directly
- * onto a SurfaceView using MediaCodec's built-in surface rendering.
- */
 class ReceiverActivity : AppCompatActivity() {
 
     private lateinit var surfaceView: SurfaceView
     private lateinit var statusText: TextView
-    private var nsdManager: NsdManager? = null
-    private var discoveryListener: NsdManager.DiscoveryListener? = null
-    private var multicastLock: WifiManager.MulticastLock? = null
+    private lateinit var wifiDirect: WifiDirectHelper
+
     private var decoder: MediaCodec? = null
     private var socket: Socket? = null
     private val running = AtomicBoolean(false)
     private var receiveThread: Thread? = null
-    private var connectedToService = false
+    private var alreadyConnecting = false
+
+    private val requiredPermsLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+        ) { results ->
+        if (results.values.all { it }) {
+            wifiDirect.discoverPeers()
+        } else {
+            statusText.text = "ต้องอนุญาตสิทธิ์เพื่อค้นหาอุปกรณ์ WiFi Direct"
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -39,51 +47,88 @@ class ReceiverActivity : AppCompatActivity() {
         surfaceView = findViewById(R.id.surfaceView)
         statusText = findViewById(R.id.statusText)
 
-        acquireMulticastLock()
-        startDiscovery()
+        wifiDirect = WifiDirectHelper(
+            context = this,
+            onPeersChanged = { peers -> runOnUiThread { showPeerPicker(peers) } },
+            onConnectionChanged = { info -> onWifiDirectConnected(info) }
+            )
     }
 
-    private fun acquireMulticastLock() {
-        val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        multicastLock = wifi.createMulticastLock("screenMirrorReceiverLock").apply {
-            setReferenceCounted(true)
-            acquire()
+    override fun onStart() {
+        super.onStart()
+        wifiDirect.register()
+        requestPermsThenDiscover()
+    }
+
+    override fun onStop() {
+        wifiDirect.unregister()
+        super.onStop()
+    }
+
+    private fun requestPermsThenDiscover() {
+        statusText.text = "กำลังค้นหาอุปกรณ์..."
+        val perms = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.NEARBY_WIFI_DEVICES)
+            != PackageManager.PERMISSION_GRANTED
+                ) {
+                perms.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+            }
+        } else {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+            != PackageManager.PERMISSION_GRANTED
+                ) {
+                perms.add(Manifest.permission.ACCESS_FINE_LOCATION)
+            }
+        }
+        if (perms.isEmpty()) {
+            wifiDirect.discoverPeers()
+        } else {
+            requiredPermsLauncher.launch(perms.toTypedArray())
         }
     }
 
-    private fun startDiscovery() {
-        statusText.text = "กำลังค้นหาอุปกรณ์..."
-        nsdManager = getSystemService(Context.NSD_SERVICE) as NsdManager
-        discoveryListener = object : NsdManager.DiscoveryListener {
-            override fun onDiscoveryStarted(serviceType: String) {}
-            override fun onServiceFound(service: NsdServiceInfo) {
-                if (service.serviceType.contains("_screenmirror") && !connectedToService) {
-                    nsdManager?.resolveService(service, object : NsdManager.ResolveListener {
-                        override fun onResolveFailed(info: NsdServiceInfo, errorCode: Int) {
-                            Log.e("Receiver", "Resolve failed: $errorCode")
-                        }
-                        override fun onServiceResolved(info: NsdServiceInfo) {
-                            connectedToService = true
-                            runOnUiThread {
-                                statusText.text = "เจออุปกรณ์: ${info.serviceName} กำลังเชื่อมต่อ..."
-                            }
-                            val host = info.host.hostAddress ?: return
-                            connectToSender(host, info.port)
-                        }
-                    })
+    private var pickerShown = false
+
+    private fun showPeerPicker(peers: List<WifiP2pDevice>) {
+        if (alreadyConnecting || pickerShown || peers.isEmpty()) return
+        pickerShown = true
+        val names = peers.map { it.deviceName.ifBlank { it.deviceAddress } }.toTypedArray()
+
+        AlertDialog.Builder(this)
+        .setTitle("เลือกอุปกรณ์ที่จะรับหน้าจอ")
+        .setItems(names) { _, which ->
+            alreadyConnecting = true
+            val device = peers[which]
+            statusText.text = "กำลังเชื่อมต่อกับ ${device.deviceName}..."
+            wifiDirect.connect(device) { success ->
+                if (!success) {
+                    runOnUiThread {
+                        statusText.text = "เชื่อมต่อไม่สำเร็จ ลองใหม่อีกครั้ง"
+                        alreadyConnecting = false
+                        pickerShown = false
+                    }
                 }
             }
-            override fun onServiceLost(service: NsdServiceInfo) {}
-            override fun onDiscoveryStopped(serviceType: String) {}
-            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {}
-            override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {}
         }
-        nsdManager!!.discoverServices(
-            "_screenmirror._tcp.", NsdManager.PROTOCOL_DNS_SD, discoveryListener
-        )
+        .setOnCancelListener {
+            pickerShown = false
+        }
+        .setNegativeButton("ค้นหาใหม่") { _, _ ->
+            pickerShown = false
+            wifiDirect.discoverPeers()
+        }
+        .show()
+    }
+
+    private fun onWifiDirectConnected(info: WifiP2pInfo) {
+        val host = info.groupOwnerAddress?.hostAddress ?: return
+        runOnUiThread { statusText.text = "เชื่อมต่อ WiFi Direct สำเร็จ กำลังรับสัญญาณ..." }
+        connectToSender(host, SenderService.PORT)
     }
 
     private fun connectToSender(host: String, port: Int) {
+        if (running.get()) return
         running.set(true)
         receiveThread = Thread {
             try {
@@ -105,7 +150,6 @@ class ReceiverActivity : AppCompatActivity() {
 
     private fun waitForSurfaceAndDecode(input: DataInputStream, width: Int, height: Int) {
         val holder = surfaceView.holder
-        // Simple wait loop until the SurfaceView's Surface is ready to draw on
         var attempts = 0
         while (!holder.surface.isValid && attempts < 100) {
             Thread.sleep(50)
@@ -135,7 +179,7 @@ class ReceiverActivity : AppCompatActivity() {
                 val bufferInfo = MediaCodec.BufferInfo()
                 var outIndex = decoder!!.dequeueOutputBuffer(bufferInfo, 0)
                 while (outIndex >= 0) {
-                    decoder!!.releaseOutputBuffer(outIndex, true) // true = render to surface
+                    decoder!!.releaseOutputBuffer(outIndex, true)
                     outIndex = decoder!!.dequeueOutputBuffer(bufferInfo, 0)
                 }
             }
@@ -146,11 +190,9 @@ class ReceiverActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         running.set(false)
-        try { receiveThread?.interrupt() } catch (_: Exception) {}
-        try { socket?.close() } catch (_: Exception) {}
-        try { decoder?.stop(); decoder?.release() } catch (_: Exception) {}
-        try { discoveryListener?.let { nsdManager?.stopServiceDiscovery(it) } } catch (_: Exception) {}
-        try { multicastLock?.release() } catch (_: Exception) {}
+        try { receiveThread?.interrupt() } catch (e: Exception) {}
+        try { socket?.close() } catch (e: Exception) {}
+        try { decoder?.stop(); decoder?.release() } catch (e: Exception) {}
         super.onDestroy()
     }
 }
