@@ -14,21 +14,15 @@ import androidx.core.content.ContextCompat
 
 class MainActivity : AppCompatActivity() {
 
-    // Handles the system's "Start recording / casting?" permission dialog
+    private lateinit var wifiDirect: WifiDirectHelper
+    private var pendingProjectionResult: Pair<Int, Intent>? = null
+
     private val projectionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
-    ) { result ->
+        ) { result ->
         if (result.resultCode == RESULT_OK && result.data != null) {
-            val intent = Intent(this, SenderService::class.java).apply {
-                putExtra(SenderService.EXTRA_RESULT_CODE, result.resultCode)
-                putExtra(SenderService.EXTRA_RESULT_DATA, result.data)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(intent)
-            } else {
-                startService(intent)
-            }
-            Toast.makeText(this, "เริ่มแชร์หน้าจอแล้ว รอให้เครื่องรับเชื่อมต่อ", Toast.LENGTH_LONG).show()
+            pendingProjectionResult = result.resultCode to result.data!!
+            startWifiDirectGroupThenSender()
         } else {
             Toast.makeText(this, "ไม่ได้รับอนุญาตให้แคปหน้าจอ", Toast.LENGTH_SHORT).show()
         }
@@ -36,14 +30,21 @@ class MainActivity : AppCompatActivity() {
 
     private val notifPermLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { /* proceed regardless of result */ }
+        ) { /* proceed regardless of result */ }
+
+    private val requiredPermsLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+        ) { /* proceed regardless; we check again before using WiFi Direct */ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        wifiDirect = WifiDirectHelper(this)
+
         findViewById<Button>(R.id.btnSender).setOnClickListener {
             requestNotifPermIfNeeded()
+            requestWifiDirectPermsIfNeeded()
             val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             projectionLauncher.launch(mpm.createScreenCaptureIntent())
         }
@@ -53,13 +54,78 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        wifiDirect.register()
+    }
+
+    override fun onStop() {
+        wifiDirect.unregister()
+        super.onStop()
+    }
+
+    private fun startWifiDirectGroupThenSender() {
+        Toast.makeText(this, "กำลังสร้างกลุ่ม WiFi Direct...", Toast.LENGTH_SHORT).show()
+        wifiDirect.createGroup { success ->
+            runOnUiThread {
+                if (success) {
+                    Toast.makeText(
+                        this,
+                        "สร้างกลุ่มสำเร็จ พร้อมให้เครื่องรับเชื่อมต่อ",
+                        Toast.LENGTH_LONG
+                        ).show()
+                    launchSenderService()
+                } else {
+                    Toast.makeText(
+                        this,
+                        "สร้างกลุ่ม WiFi Direct ไม่สำเร็จ ลองเปิด WiFi และลองใหม่",
+                        Toast.LENGTH_LONG
+                        ).show()
+                }
+            }
+        }
+    }
+
+    private fun launchSenderService() {
+        val (resultCode, data) = pendingProjectionResult ?: return
+        val intent = Intent(this, SenderService::class.java).apply {
+            putExtra(SenderService.EXTRA_RESULT_CODE, resultCode)
+            putExtra(SenderService.EXTRA_RESULT_DATA, data)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+    }
+
     private fun requestNotifPermIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED
-            ) {
+            != PackageManager.PERMISSION_GRANTED
+                ) {
                 notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
+        }
+    }
+
+    private fun requestWifiDirectPermsIfNeeded() {
+        val perms = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.NEARBY_WIFI_DEVICES)
+            != PackageManager.PERMISSION_GRANTED
+                ) {
+                perms.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+            }
+        } else {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+            != PackageManager.PERMISSION_GRANTED
+                ) {
+                perms.add(Manifest.permission.ACCESS_FINE_LOCATION)
+            }
+        }
+        if (perms.isNotEmpty()) {
+            requiredPermsLauncher.launch(perms.toTypedArray())
         }
     }
 }
